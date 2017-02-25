@@ -7,7 +7,7 @@
 /* ============================================================ */
 
 //comment out this line to hide prints:
-#define DEBUG
+//#define DEBUG
 #define trace_x 50
 #define trace_y 57
 #define DEBUG_DELAY 0
@@ -87,6 +87,7 @@ typedef struct {
 	float contrast;
 	float v;
 	unsigned char mode;
+	unsigned int stepsPerRender;
 }parameter_set;
 parameter_set params;
 
@@ -100,6 +101,10 @@ unsigned char* barrier;
 unsigned char* barrier_gpu;
 d2q9_node* d2q9_gpu;
 parameter_set* params_gpu;
+
+char needsUpdate = 1;
+int prex = -1;
+int prey = -1;
 
 enum directions {
 	d0 = 0,
@@ -128,14 +133,13 @@ cudaError_t ierrSync;
 
 void getParams(parameter_set* params)
 {
-	float viscosity = 0.005;
-
+	params->viscosity = 0.005;
 	params->contrast = 75;
 	params->v = 0.1;
 	params->mode = mCurl;
-	params->omega = 1 / (3 * viscosity + 0.5);
-	params->height = 300;
-	params->width = 400;
+	params->height = 200;
+	params->width = 300;
+	params->stepsPerRender = 10;
 }
 
 //------------------------------------------------------------------------------//
@@ -286,13 +290,13 @@ uchar4 getRGB_curl(int x, int y, lbm_node* array, parameter_set* params)
 }
 
 __device__
-void computeColor(lbm_node* array, int x, int y, parameter_set* params, uchar4* image, unsigned char* barrier)
+void computeColor(lbm_node* array, int x, int y, parameter_set* params, uchar4* image, unsigned char* barrier, int prex, int prey)
 {
 	int i = getIndex(x, y, params);
+	int prei = getIndex(prex, prey, params);
 
 	if (barrier[i] == 1)
 	{
-		//DEBUG_PRINT("drawin a barrier!\n");
 		image[i].w = 255;
 		image[i].x = 255;
 		image[i].y = 255;
@@ -319,11 +323,11 @@ void computeColor(lbm_node* array, int x, int y, parameter_set* params, uchar4* 
 			break;
 		}
 	}
-	if (x == trace_x && y == trace_y)
+	if (i == prei)
 	{
 		image[i].x = 255;
 		image[i].y = 0;
-		image[i].z = 255;
+		image[i].z = 0;
 		image[i].w = 255;
 	}
 }
@@ -377,6 +381,8 @@ void collide(d2q9_node* d2q9, lbm_node* before, lbm_node* after, parameter_set* 
 	int y = blockIdx.y * blockDim.y + threadIdx.y;
 	int i = getIndex(x, y, params);
 
+	float omega = 1 / (3 * params->viscosity + 0.5);
+
 	//toss out out of bounds
 	if (x<0 || x >= params->width || y<0 || y >= params->height)
 		return;
@@ -389,33 +395,12 @@ void collide(d2q9_node* d2q9, lbm_node* before, lbm_node* after, parameter_set* 
 		printNode(&(after[i]), before, after);
 	}
 
-
-	/*if (barrier[i] == 1)
-	{
-		//after[i].rho =1;
-		//after[i].ux = 0;
-		//after[i].uy = 0;
-		for (int j = 0;j < 9;j++)
-		{
-			(after[i].f)[j] = (before[i].f)[j];
-		}
-		if (x == trace_x && y == trace_y)
-		{
-			//DEBUG_PRINT(("\n\nPre-Collision (before):\n"));
-			//printNode(&(before[i]), before, after);
-			DEBUG_PRINT(("\n\nwall test results (after):\n"));
-			printNode(&(after[i]), before, after);
-		}
-
-		return;
-	}*/
-
 	macro_gen(before[i].f, &(after[i].ux), &(after[i].uy), &(after[i].rho), i, params);
 
 	int dir = 0;
 	for (dir = 0; dir<9;dir += 1)
 	{
-		(after[i].f)[dir] = (before[i].f)[dir] + params->omega
+		(after[i].f)[dir] = (before[i].f)[dir] + omega
 			* (accel_gen(dir, after[i].ux, after[i].uy,
 				after[i].ux * after[i].ux + after[i].uy
 				* after[i].uy, after[i].rho, d2q9) - (before[i].f)[dir]);
@@ -542,7 +527,7 @@ parameter_set* params, d2q9_node* d2q9)
 
 __global__
 void bounceAndRender(d2q9_node* d2q9, lbm_node* before, lbm_node* after,
-	unsigned char* barrier, parameter_set* params, uchar4* image)
+	unsigned char* barrier, parameter_set* params, uchar4* image, int prex, int prey)
 {
 	int x = blockIdx.x * blockDim.x + threadIdx.x;
 	int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -589,7 +574,7 @@ void bounceAndRender(d2q9_node* d2q9, lbm_node* before, lbm_node* after,
 		printNode(&(after[i]), before, after);
 	}
 
-	computeColor(after, x, y, params, image, barrier);
+	computeColor(after, x, y, params, image, barrier, prex, prey);
 }
 
 //--------------------------------------------------------------------------------//
@@ -611,31 +596,6 @@ void init_d2q9(d2q9_node* d2q9)
 	d2q9[8].ex =  1;	d2q9[8].ey = -1;	d2q9[8].wt = 1.0 / 36.0;	d2q9[8].op = 6;
 }
 
-void setBarrier(unsigned char* barrier)
-{
-	//int H = params.height;
-	//int W = params.width;
-	/*
-	barrier[getIndex_cpu(99, 100)] = 1;
-	barrier[getIndex_cpu(100, 100)] = 1;
-	barrier[getIndex_cpu(101, 100)] = 1;
-	barrier[getIndex_cpu(102, 100)] = 1;
-	barrier[getIndex_cpu(103, 100)] = 1;
-	*/
-
-	for (int i = 0; i < 20; i++)
-	{
-		
-		/*for (int j = 0; j < 10; j++)
-		{
-		//if(i==0 || i==9 || j==0 || j == 9)
-		barrier[getIndex_cpu(i+100, j+100)] = 1;
-		}
-		//barrier[getIndex_cpu(50, 47 + i)] = 1;
-		*/
-		barrier[getIndex_cpu(100 + (i / 3), 100 + i)] = 1;
-	}
-}
 
 void zeroSite(lbm_node* array, int index)
 {
@@ -649,16 +609,19 @@ void zeroSite(lbm_node* array, int index)
 	array[index].uy = 0;
 }
 
+void initBoundaries()
+{
+	int W = params.width;
+	int H = params.height;
+}
+
 void initFluid() {
-	getParams(&params);
 	int W = params.width;
 	int H = params.height;
 	float v = params.v;
-	printf("velocity is %.6f my dude\n", v);
+	//printf("velocity is %.6f my dude\n", v);
 
 	barrier = (unsigned char*)calloc(W*H, sizeof(unsigned char));
-	setBarrier(barrier);
-
 	array1 = (lbm_node*)calloc(W*H, sizeof(lbm_node));
 	array2 = (lbm_node*)calloc(W*H, sizeof(lbm_node));
 
@@ -675,27 +638,18 @@ void initFluid() {
 		for (int y = 0; y < params.height; y++)
 		{
 			i = getIndex_cpu(x, y);
-			/*
-			if (barrier[i] == 1)
-			{
-				zeroSite(before, i);
-				DEBUG_PRINT(("there's a barrier here!\n"));
-			}
-			else
-			{*/
-				(before[i].f)[d0] = d2q9[d0].wt  * (1 - 1.5 * v * v);
-				(before[i].f)[dE] = d2q9[dE].wt  * (1 + 3 * v + 3 * v * v);
-				(before[i].f)[dW] = d2q9[dW].wt  * (1 - 3 * v + 3 * v * v);
-				(before[i].f)[dN] = d2q9[dN].wt  * (1 - 1.5 * v * v);
-				(before[i].f)[dS] = d2q9[dS].wt  * (1 - 1.5 * v * v);
-				(before[i].f)[dNE] = d2q9[dNE].wt * (1 + 3 * v + 3 * v * v);
-				(before[i].f)[dSE] = d2q9[dSE].wt * (1 + 3 * v + 3 * v * v);
-				(before[i].f)[dNW] = d2q9[dNW].wt * (1 - 3 * v + 3 * v * v);
-				(before[i].f)[dSW] = d2q9[dSW].wt * (1 - 3 * v + 3 * v * v);
-				before[i].rho = 1;
-				before[i].ux = params.v;
-				before[i].uy = 0;
-			//}
+			(before[i].f)[d0] = d2q9[d0].wt  * (1 - 1.5 * v * v);
+			(before[i].f)[dE] = d2q9[dE].wt  * (1 + 3 * v + 3 * v * v);
+			(before[i].f)[dW] = d2q9[dW].wt  * (1 - 3 * v + 3 * v * v);
+			(before[i].f)[dN] = d2q9[dN].wt  * (1 - 1.5 * v * v);
+			(before[i].f)[dS] = d2q9[dS].wt  * (1 - 1.5 * v * v);
+			(before[i].f)[dNE] = d2q9[dNE].wt * (1 + 3 * v + 3 * v * v);
+			(before[i].f)[dSE] = d2q9[dSE].wt * (1 + 3 * v + 3 * v * v);
+			(before[i].f)[dNW] = d2q9[dNW].wt * (1 - 3 * v + 3 * v * v);
+			(before[i].f)[dSW] = d2q9[dSW].wt * (1 - 3 * v + 3 * v * v);
+			before[i].rho = 1;
+			before[i].ux = params.v;
+			before[i].uy = 0;
 		}
 	}
 
@@ -731,24 +685,16 @@ void initFluid() {
 //and launch all 3 LBM kernels
 void kernelLauncher(uchar4* image)
 {
-	cudaMemcpy(barrier_gpu, barrier, sizeof(unsigned char)*params.width * params.height, cudaMemcpyHostToDevice);
+	if (needsUpdate)
+	{
+		cudaMemcpy(barrier_gpu, barrier, sizeof(unsigned char)*params.width * params.height, cudaMemcpyHostToDevice);
+		cudaMemcpy(params_gpu, &params, sizeof(params), cudaMemcpyHostToDevice);
+		needsUpdate = 0;
+		cudaDeviceSynchronize(); // Wait for the GPU to finish
+	}
 
 	lbm_node* before = array1_gpu;
 	lbm_node* after = array2_gpu;
-	//lbm_node* temp;
-
-	/*
-	//assign lattice buffers
-	if (!state) {
-	before = array1_gpu;
-	after = array2_gpu;
-	}
-	else {
-	before = array2_gpu;
-	after = array1_gpu;
-	}
-	state = !state;
-	*/
 
 	DEBUG_PRINT(("these are the addresses: \n\t\tb4=%p\taft=%p\n\t\tar1=%p\tar2=%p", before, after, array1_gpu, array2_gpu));
 
@@ -773,7 +719,7 @@ void kernelLauncher(uchar4* image)
 	if (ierrAsync != cudaSuccess) { DEBUG_PRINT(("Async error: %s\n", cudaGetErrorString(ierrAsync))); }
 
 
-	bounceAndRender << < number_of_blocks, threads_per_block >> > (d2q9_gpu, before, after, barrier_gpu, params_gpu, image);
+	bounceAndRender << < number_of_blocks, threads_per_block >> > (d2q9_gpu, before, after, barrier_gpu, params_gpu, image, prex, prey);
 
 	ierrSync = cudaGetLastError();
 	ierrAsync = cudaDeviceSynchronize(); // Wait for the GPU to finish
@@ -784,13 +730,178 @@ void kernelLauncher(uchar4* image)
 }
 
 //-----------------------------------------------------------//
+//                  BARRIER FUNCTIONS                        //
+//-----------------------------------------------------------//
+
+void clearBarriers()
+{
+	for (int i = 0;i < params.width;i++)
+	{
+		for (int j = 0; j < params.height;j++)
+		{
+			barrier[getIndex_cpu(i, j)] = 0;
+		}
+	}
+}
+
+void drawLineDiagonal()
+{
+	for (int i = 0; i < params.height/4; i++)
+	{
+
+		barrier[getIndex_cpu((params.width / 3) + (i / 3), params.height / 3 + i)] = 1;
+	}
+}
+
+void drawSquare()
+{
+	for (int i = 0; i < params.height/4; i++)
+	{
+
+		for (int j = 0; j < params.height / 4; j++)
+		{
+			//if(i==0 || i== params.height / 4-1 || j==0 || j == params.height / 4-1)
+			barrier[getIndex_cpu(i+params.width/3, j+params.height * 3 / 8)] = 1;
+		}
+		
+	}
+}
+
+//-----------------------------------------------------------//
 //              OPENGL CALLBACK FUNCTIONS                    //
 //-----------------------------------------------------------//
+char waitingForSpeed = 0;
+char waitingForViscosity = 0;
+char waitingForRate = 0;
+
 
 //keyboard callback
 void keyboard(unsigned char a, int b, int c)
 {
 	DEBUG_PRINT(("%x pressed\n", a));
+
+	if (!(waitingForSpeed || waitingForViscosity || waitingForRate))
+	{
+		switch (a)
+		{
+			case'1':
+				params.mode = mRho;
+				printf("render mode set to rho\n");
+				break;
+			case'2':
+				params.mode = mCurl;
+				printf("render mode set to curl\n");
+				break;
+			case'3':
+				params.mode = mSpeed;
+				printf("render mode set to speed\n");
+				break;
+			case'4':
+				params.mode = mUx;
+				printf("render mode set to Ux\n");
+				break;
+			case'5':
+				params.mode = mUy;
+				printf("render mode set to Uy\n");
+				break;
+			case'q':
+				clearBarriers();
+				printf("Barriers Cleared!\n");
+				break;
+			case'w':
+				initFluid();
+				printf("Field Reset!\n");
+				break;
+			case'a':
+				clearBarriers();
+				//drawLineLong();
+				break;
+			case's':
+				clearBarriers();
+				//drawLineShort();
+				break;
+			case'd':
+				clearBarriers();
+				drawLineDiagonal();
+				break;
+			case'f':
+				clearBarriers();
+				drawSquare();
+				break;
+			case'z':
+				printf("Enter speed using 1-0:\n");
+				waitingForSpeed = 1;
+				break;
+			case'x':
+				printf("Enter viscosity using 1-0:\n");
+				waitingForViscosity = 1;
+				break;
+			case'c':
+				printf("Enter refresh rate using 1-0:\n");
+				waitingForRate = 1;
+				break;
+
+			default: break;
+		}
+	}
+	else if (waitingForViscosity)
+	{
+		switch (a)
+		{
+			case '1': params.viscosity = 0.003; break;
+			case '2': params.viscosity = 0.005; break;
+			case '3': params.viscosity = 0.008; break;
+			case '4': params.viscosity = 0.011; break;
+			case '5': params.viscosity = 0.016; break;
+			case '6': params.viscosity = 0.02; break;
+			case '7': params.viscosity = 0.04; break;
+			case '8': params.viscosity = 0.08; break;
+			case '9': params.viscosity = 0.13; break;
+			case '0': params.viscosity = 0.2; break;
+			default: break;
+		}
+		waitingForViscosity = 0;
+		printf("viscosity set to %.3f\n", params.viscosity);
+	}
+	else if (waitingForSpeed)
+	{
+		switch (a)
+		{
+			case '1': params.v = 0.01; break;
+			case '2': params.v = 0.03; break;
+			case '3': params.v = 0.05; break;
+			case '4': params.v = 0.07; break;
+			case '5': params.v = 0.09; break;
+			case '6': params.v = 0.11; break;
+			case '7': params.v = 0.13; break;
+			case '8': params.v = 0.14; break;
+			case '9': params.v = 0.17; break;
+			case '0': params.v = 0.2; break;
+			default: break;
+		}
+		waitingForSpeed = 0;
+		printf("speed set to %.2f\n", params.v);
+	}
+	else if (waitingForRate)
+	{
+		switch (a)
+		{
+		case '1': params.stepsPerRender = 1; break;
+		case '2': params.stepsPerRender = 2; break;
+		case '3': params.stepsPerRender = 3; break;
+		case '4': params.stepsPerRender = 4; break;
+		case '5': params.stepsPerRender = 5; break;
+		case '6': params.stepsPerRender = 6; break;
+		case '7': params.stepsPerRender = 7; break;
+		case '8': params.stepsPerRender = 8; break;
+		case '9': params.stepsPerRender = 9; break;
+		case '0': params.stepsPerRender = 10; break;
+		default: break;
+		}
+		waitingForRate = 0;
+		printf("refresh rate set to %d\n", params.stepsPerRender);
+	}
+	needsUpdate = 1;
 }
 
 //special keyboard callback
@@ -799,18 +910,79 @@ void handleSpecialKeypress(int a, int b, int c)
 
 }
 
+int current_button = GLUT_LEFT_BUTTON;
+
+void mouseClick(int button, int state, int x, int y)
+{
+	if (state == GLUT_DOWN)
+	{
+		if(button==GLUT_LEFT_BUTTON)
+		{
+			current_button = GLUT_LEFT_BUTTON;
+			int lx, ly; // lattice coordinates
+			lx = x * params.width / glutGet(GLUT_WINDOW_WIDTH);
+			ly = y * params.height / glutGet(GLUT_WINDOW_HEIGHT);
+
+			if (lx >= params.width || ly >= params.height)
+				return;
+
+			barrier[getIndex_cpu(lx, ly)] = 1;
+			needsUpdate = 1;
+		}
+		else if (button == GLUT_RIGHT_BUTTON)
+		{
+			current_button = GLUT_RIGHT_BUTTON;
+			int lx, ly; // lattice coordinates
+			lx = x * params.width / glutGet(GLUT_WINDOW_WIDTH);
+			ly = y * params.height / glutGet(GLUT_WINDOW_HEIGHT);
+
+			if (lx >= params.width || ly >= params.height)
+				return;
+
+			barrier[getIndex_cpu(lx, ly)] = 0;
+			needsUpdate = 1;
+		}
+	}
+}
+
 //mouse move callback
-void mouseMove(int a, int b)
+void mouseMove(int x, int y)
 {
 
+	int lx, ly; // lattice coordinates
+	lx = x * params.width / glutGet(GLUT_WINDOW_WIDTH);
+	ly = y * params.height / glutGet(GLUT_WINDOW_HEIGHT);
+
+	if (lx >= params.width || ly >= params.height)
+		return;
+
+	prex = lx;
+	prey = ly;
 }
 
 //mouse drag callback
 void mouseDrag(int x, int y)
 {
-	if (x >= params.width || y >= params.height)
+	int lx, ly; // lattice coordinates
+	lx = x * params.width / glutGet(GLUT_WINDOW_WIDTH);
+	ly = y * params.height / glutGet(GLUT_WINDOW_HEIGHT);
+
+	if (lx >= params.width || ly >= params.height)
 		return;
-	barrier[getIndex_cpu(x, y)] = 1;
+
+	prex = lx;
+	prey = ly;
+
+	if (current_button == GLUT_LEFT_BUTTON)
+	{
+		barrier[getIndex_cpu(lx, ly)] = 1;
+	}
+	else if (current_button == GLUT_RIGHT_BUTTON)
+	{
+		barrier[getIndex_cpu(lx, ly)] = 0;
+	}
+
+	needsUpdate = 1;
 }
 
 //gl exit callback
@@ -829,7 +1001,6 @@ void exitfunc()
 	cudaFree(barrier_gpu);
 	cudaFree(params_gpu);
 	cudaFree(d2q9_gpu);
-	//add cudaFree calls here!
 }
 
 //display stats of all detected cuda capable devices,
@@ -847,13 +1018,14 @@ int deviceQuery()
 	for (i = 0; i < nDevices; ++i)
 	{
 		ierr = cudaGetDeviceProperties(&prop, i);
-		DEBUG_PRINT(("Device number: %d\n", i));
-		DEBUG_PRINT(("  Device name: %s\n", prop.name));
-		DEBUG_PRINT(("  Compute capability: %d.%d\n", prop.major, prop.minor));
-		DEBUG_PRINT(("  Max threads per block: %d\n", prop.maxThreadsPerBlock));
-		DEBUG_PRINT(("  Max threads in X-dimension of block: %d\n", prop.maxThreadsDim[0]));
-		DEBUG_PRINT(("  Max threads in Y-dimension of block: %d\n", prop.maxThreadsDim[1]));
-		DEBUG_PRINT(("  Max threads in Z-dimension of block: %d\n\n", prop.maxThreadsDim[2]));
+		printf("Device number: %d\n", i);
+		printf("  Device name: %s\n", prop.name);
+		printf("  Compute capability: %d.%d\n", prop.major, prop.minor);
+		printf("  Max threads per block: %d\n", prop.maxThreadsPerBlock);
+		printf("  Max threads in X-dimension of block: %d\n", prop.maxThreadsDim[0]);
+		printf("  Max threads in Y-dimension of block: %d\n", prop.maxThreadsDim[1]);
+		printf("  Max threads in Z-dimension of block: %d\n\n", prop.maxThreadsDim[2]);
+		if (ierr != cudaSuccess) { printf("error: %s\n", cudaGetErrorString(ierr)); }
 	}
 
 	return nDevices;
@@ -865,6 +1037,7 @@ int deviceQuery()
 //               RENDERING AND DISPLAY FUNCTIONS                              //
 //----------------------------------------------------------------------------//
 
+
 //render the image (but do not display it yet)
 void render(int delta_t) {
 	//reset image pointer
@@ -875,15 +1048,18 @@ void render(int delta_t) {
 	cudaGraphicsMapResources(1, &cuda_pbo_resource, 0);
 	cudaGraphicsResourceGetMappedPointer((void **)&d_out, NULL, cuda_pbo_resource);
 
-	//launch cuda kernels to calculate LBM step
-	kernelLauncher(d_out);
 
+	//launch cuda kernels to calculate LBM step
+	for (int i = 0; i < params.stepsPerRender; i++)
+	{
+		kernelLauncher(d_out);
+	}
 	//unmap the resources for next time
 	cudaGraphicsUnmapResources(1, &cuda_pbo_resource, 0);
 }
 
 //update textures to reflect texture memory
-void drawTexture() {
+void drawTextureScaled() {
 	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, params.width, params.height,
 		0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 
@@ -906,7 +1082,7 @@ void display(int delta_t) {
 	render(delta_t);
 
 	//redraw textures
-	drawTexture();
+	drawTextureScaled();
 
 	//swap the buffers
 	glutSwapBuffers();
@@ -961,6 +1137,7 @@ void initGLUT(int *argc, char **argv) {
 	glutKeyboardFunc(keyboard);
 	glutSpecialFunc(handleSpecialKeypress);
 	glutPassiveMotionFunc(mouseMove);
+	glutMouseFunc(mouseClick);
 	glutMotionFunc(mouseDrag);
 	glutDisplayFunc(update);
 	glutIdleFunc(update);
@@ -974,7 +1151,7 @@ void initGLUT(int *argc, char **argv) {
 int main(int argc, char** argv) {
 
 	//discover all Cuda-capable hardware
-	int i = 1;//deviceQuery();
+	int i = deviceQuery();
 	//DEBUG_PRINT(("num devices is %d\n", i));
 
 	if (i < 1)
@@ -985,6 +1162,8 @@ int main(int argc, char** argv) {
 	}
 
 	//allocate memory and initialize fluid arrays
+	initBoundaries();
+	getParams(&params);
 	initFluid();
 
 	//construct output window
